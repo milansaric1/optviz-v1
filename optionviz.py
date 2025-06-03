@@ -380,6 +380,10 @@ with tab3:
             )
             
             if not pivot_calls.empty:
+                # Calculate min and max implied volatility from the pivot table values
+                z_min = float(pivot_calls.values.min()) + pivot_calls.values.min() * 0.05
+                z_max = float(pivot_calls.values.max()) + pivot_calls.values.max() * 0.05
+                
                 fig_surface = go.Figure()
                 
                 # Add CALL surface
@@ -395,8 +399,8 @@ with tab3:
                     title="3D Implied Volatility Surface",
                     scene=dict(
                         xaxis=dict(title="Days to Expiration", range=[0, 100]),
-                        yaxis_title="Strike Price", 
-                        zaxis_title="Implied Volatility"
+                        yaxis=dict(title="Strike Price"),
+                        zaxis=dict(title="Implied Volatility", range=[z_min, z_max])
                     ),
                     height=600
                 )
