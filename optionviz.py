@@ -400,7 +400,8 @@ with tab3:
                     scene=dict(
                         xaxis=dict(title="Days to Expiration", range=[0, 100]),
                         yaxis=dict(title="Strike Price"),
-                        zaxis=dict(title="Implied Volatility", range=[z_min, z_max])
+                        zaxis=dict(title="Implied Volatility", range=[z_min, z_max]),
+                        aspectmode="cube"  # Equal scaling for x, y, z axes
                     ),
                     height=600
                 )
