@@ -273,7 +273,7 @@ with tab1:
             top_strikes = matrix_total.head(10).index
             matrix_display = matrix.loc[top_strikes]
             
-            st.subheader("🏆 Top 10 Strikes by OI")
+            st.subheader("Top 10 Strikes by OI")
             st.dataframe(matrix_display)
 
 # =============== TAB 2: FLOW ANALYSIS ===============
