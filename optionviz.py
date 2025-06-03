@@ -394,7 +394,7 @@ with tab3:
                 fig_surface.update_layout(
                     title="3D Implied Volatility Surface",
                     scene=dict(
-                        xaxis_title="Days to Expiration",
+                        xaxis=dict(title="Days to Expiration", range=[0, 100]),
                         yaxis_title="Strike Price", 
                         zaxis_title="Implied Volatility"
                     ),
