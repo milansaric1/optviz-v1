@@ -364,6 +364,7 @@ with tab3:
             title="Volatility Term Structure (ATM)"
         )
         fig_term.update_traces(line_color="purple", marker_color="purple")
+        fig_term.update_xaxes(range=[0, 100])  # Adjust DTE scale to 0-100
         st.plotly_chart(fig_term, use_container_width=True)
 
     # 3D Volatility Surface
