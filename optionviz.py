@@ -51,9 +51,9 @@ def parse_chain(js):
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
         df["expiry"] = pd.to_datetime(df["expiry"])
-        # Fix DTE: use dates only to ignore time-of-day issues
-        today = datetime.date.today()
-        df["dte"] = (df["expiry"].dt.date - pd.to_datetime(today).date()).dt.days
+        # Fix DTE: subtract datetimes directly
+        today = pd.to_datetime(datetime.date.today())
+        df["dte"] = (df["expiry"] - today).dt.days
     return df
 
 def compute_metrics(df, underlying, focus_range=None):
@@ -222,13 +222,10 @@ try:
 except requests.exceptions.HTTPError as e:
     if e.response.status_code == 400:
         st.error(f"Invalid symbol: {sym}. Please check the ticker symbol and try again.")
-        st.stop()
     elif e.response.status_code == 404:
         st.error(f"Symbol {sym} not found or not supported for options data.")
-        st.stop()
     else:
         st.error(f"Error fetching data for {sym}: {e}")
-        st.stop()
     st.stop()
 except Exception as e:
     st.error(f"An error occurred: {e}")
