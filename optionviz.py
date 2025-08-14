@@ -5,7 +5,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
-import datetime
 
 st.set_page_config(layout="wide")
 st.title("OptvizV1")
@@ -23,20 +22,15 @@ def get_access_token():
 @st.cache_data(ttl=300)
 def fetch_option_chain(sym, token):
     url = "https://api.schwabapi.com/marketdata/v1/chains"
-    params = {
-        "symbol": sym,
-        "range": "ALL",  # Explicitly fetch all strikes
-        "includeUnderlyingQuote": "true"
-    }
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params)
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params={"symbol": sym})
     resp.raise_for_status()
     return resp.json()
 
 def parse_chain(js):
     recs = []
-    for kind, key in [("CALL", "callExpDateMap"), ("PUT", "putExpDateMap")]:
+    for kind, key in [("CALL","callExpDateMap"), ("PUT","putExpDateMap")]:
         for exp_key, strikes in js.get(key, {}).items():
-            date = exp_key.split(":", 1)[0]
+            date = exp_key.split(":",1)[0]
             for strike_str, opts in strikes.items():
                 for o in opts:
                     r = {"expiry": date, "strike": float(strike_str), "type": kind}
@@ -44,16 +38,9 @@ def parse_chain(js):
                     recs.append(r)
     df = pd.DataFrame(recs)
     if not df.empty:
-        # Convert strings like "NaN" to actual NaN and ensure numeric
-        numeric_cols = ["volatility", "delta", "gamma", "theta", "vega", "rho", "bid", "ask", "last", "openInterest", "totalVolume"]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
         df["expiry"] = pd.to_datetime(df["expiry"])
-        # Fix DTE: subtract datetimes directly
-        today = pd.to_datetime(datetime.date.today())
-        df["dte"] = (df["expiry"] - today).dt.days
+        # Add days to expiration
+        df["dte"] = (df["expiry"] - pd.Timestamp.now()).dt.days
     return df
 
 def compute_metrics(df, underlying, focus_range=None):
@@ -75,28 +62,28 @@ def compute_metrics(df, underlying, focus_range=None):
         upper_bound = underlying * (1 + focus_range)
         df = df[(df["strike"] >= lower_bound) & (df["strike"] <= upper_bound)]
     
-    # Calculate exposures (gamma/delta now numeric, so no errors)
+    # Calculate exposures
     df["gamma_exp"] = df["gamma"] * df["openInterest"] * 100
     df["delta_exp"] = df["delta"] * df["openInterest"] * 100
 
     # Group by strike and type
     gbt = (
-        df.groupby(["strike", "type"])["gamma_exp"]
-        .sum()
-        .unstack(fill_value=0)
-        .reset_index()
+        df.groupby(["strike","type"])["gamma_exp"]
+          .sum()
+          .unstack(fill_value=0)
+          .reset_index()
     )
     oibt = (
-        df.groupby(["strike", "type"])["openInterest"]
-        .sum()
-        .unstack(fill_value=0)
-        .reset_index()
+        df.groupby(["strike","type"])["openInterest"]
+          .sum()
+          .unstack(fill_value=0)
+          .reset_index()
     )
     vibt = (
-        df.groupby(["strike", "type"])["totalVolume"]
-        .sum()
-        .unstack(fill_value=0)
-        .reset_index()
+        df.groupby(["strike","type"])["totalVolume"]
+          .sum()
+          .unstack(fill_value=0)
+          .reset_index()
     )
 
     # Calculate NET GEX and NET DEX by strike
@@ -120,9 +107,9 @@ def compute_metrics(df, underlying, focus_range=None):
     net_gex_df = pd.DataFrame(net_gex_data)
     net_dex_df = pd.DataFrame(net_dex_data)
 
-    # Volatility surface data (average call/put if both exist)
+    # Volatility surface data
     vol_surface = df[df["volatility"].notna() & (df["volatility"] > 0)].copy()
-    vol_surface = vol_surface.groupby(["strike", "dte", "expiry"])["volatility"].mean().reset_index()
+    vol_surface = vol_surface[["strike", "dte", "volatility", "type", "expiry"]].drop_duplicates()
 
     # Volatility term structure (ATM vol across expirations)
     vol_term_data = []
@@ -146,7 +133,7 @@ def compute_metrics(df, underlying, focus_range=None):
 
     # Calculate levels
     strikes = sorted(df["strike"].unique()) if not df.empty else []
-    atm = min(strikes, key=lambda x: abs(x - underlying)) if strikes else None
+    atm = min(strikes, key=lambda x: abs(x-underlying)) if strikes else None
     
     oi_by_strike = df.groupby("strike")["openInterest"].sum()
     max_oi = oi_by_strike.idxmax() if not oi_by_strike.empty else None
@@ -156,9 +143,9 @@ def compute_metrics(df, underlying, focus_range=None):
 
     pain = {}
     for S in strikes:
-        c = df[(df["type"] == "CALL") & (df["strike"] <= S)]
-        p = df[(df["type"] == "PUT") & (df["strike"] >= S)]
-        loss = ((S - c["strike"]) * c["openInterest"] * 100).sum() + ((p["strike"] - S) * p["openInterest"] * 100).sum()
+        c = df[(df.type=="CALL")&(df.strike<=S)]
+        p = df[(df.type=="PUT") &(df.strike>=S)]
+        loss = ((S-c.strike)*c.openInterest*100).sum() + ((p.strike-S)*p.openInterest*100).sum()
         pain[S] = loss
     max_pain = min(pain, key=pain.get) if pain else None
 
@@ -179,16 +166,8 @@ def compute_metrics(df, underlying, focus_range=None):
     }
 
 def get_0dte_data(df):
-    """Filter for true 0DTE (same-day expiration)"""
-    return df[df["dte"] == 0]
-
-def customize_bar_fig(fig, under, strikes):
-    """Make bars more legible and add vline"""
-    fig.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
-    if len(strikes) > 1:
-        min_step = np.min(np.diff(sorted(strikes)))
-        fig.update_traces(width=min_step * 0.8)
-    return fig
+    """Filter for 0DTE (same day expiration) options"""
+    return df[df["dte"] <= 1]  # Include today and tomorrow for 0DTE
 
 # Main App
 sym = st.text_input("Ticker", "").upper().strip()
@@ -201,6 +180,7 @@ try:
     js = fetch_option_chain(sym, token)
     under = js.get("underlyingPrice", 0)
     
+    # Check if we got valid option chain data
     if not js.get("callExpDateMap") and not js.get("putExpDateMap"):
         st.error(f"No options data found for {sym}. This symbol may not have tradeable options or may not be supported.")
         st.stop()
@@ -252,7 +232,7 @@ with tab1:
         levels_df = (
             pd.DataFrame.from_dict(met_full["levels"], orient="index", columns=["Strike"])
               .reset_index()
-              .rename(columns={"index": "Level"})
+              .rename(columns={"index":"Level"})
         )
         st.subheader("📍 Important Price Levels")
         st.table(levels_df)
@@ -279,9 +259,9 @@ with tab1:
         if total_call_oi > 0 and total_put_oi > 0:
             fig_pie = px.pie(
                 values=[total_call_oi, total_put_oi], 
-                names=["CALL", "PUT"],
-                color_discrete_map={"CALL": "green", "PUT": "red"},
-                title="Open Interest Distribution"
+                names=["CALL","PUT"],
+                color_discrete_map={"CALL":"green","PUT":"red"},
+                title=f"Open Interest Distribution"
             )
             st.plotly_chart(fig_pie, use_container_width=True)
         
@@ -296,7 +276,7 @@ with tab1:
             st.subheader("Top 10 Strikes by OI")
             st.dataframe(matrix_display)
 
-# =============== TAB 2: GEX/DEX ===============
+# =============== TAB 2: FLOW ANALYSIS ===============
 with tab2:
     st.subheader("GEX/DEX")
     
@@ -307,18 +287,17 @@ with tab2:
         if not met_focused["gamma_by_type"].empty:
             gdf = met_focused["gamma_by_type"].melt(
                 id_vars="strike", 
-                value_vars=[col for col in ["CALL", "PUT"] if col in met_focused["gamma_by_type"].columns],
+                value_vars=[col for col in ["CALL","PUT"] if col in met_focused["gamma_by_type"].columns],
                 var_name="type", 
                 value_name="gamma_exposure"
             )
             fig1 = px.bar(
                 gdf, x="strike", y="gamma_exposure", color="type",
                 barmode="group",
-                color_discrete_map={"CALL": "green", "PUT": "red"},
+                color_discrete_map={"CALL":"green","PUT":"red"},
                 title="Gamma Exposure by Type"
             )
-            strikes = gdf["strike"].unique()
-            fig1 = customize_bar_fig(fig1, under, strikes)
+            fig1.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
             st.plotly_chart(fig1, use_container_width=True)
 
     # Net Gamma Exposure
@@ -332,8 +311,7 @@ with tab2:
                 color="net_gex",
                 color_continuous_scale=["red", "white", "green"]
             )
-            strikes = met_focused["net_gex"]["strike"].unique()
-            fig_net_gex = customize_bar_fig(fig_net_gex, under, strikes)
+            fig_net_gex.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
             fig_net_gex.update_layout(showlegend=False)
             st.plotly_chart(fig_net_gex, use_container_width=True)
 
@@ -350,8 +328,7 @@ with tab2:
                 color="net_dex",
                 color_continuous_scale=["red", "white", "blue"]
             )
-            strikes = met_focused["net_dex"]["strike"].unique()
-            fig_net_dex = customize_bar_fig(fig_net_dex, under, strikes)
+            fig_net_dex.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
             fig_net_dex.update_layout(showlegend=False)
             st.plotly_chart(fig_net_dex, use_container_width=True)
 
@@ -360,18 +337,17 @@ with tab2:
         if not met_focused["oi_by_type"].empty:
             oidf = met_focused["oi_by_type"].melt(
                 id_vars="strike", 
-                value_vars=[col for col in ["CALL", "PUT"] if col in met_focused["oi_by_type"].columns],
+                value_vars=[col for col in ["CALL","PUT"] if col in met_focused["oi_by_type"].columns],
                 var_name="type", 
                 value_name="open_interest"
             )
             fig2 = px.bar(
                 oidf, x="strike", y="open_interest", color="type",
                 barmode="group",
-                color_discrete_map={"CALL": "green", "PUT": "red"},
+                color_discrete_map={"CALL":"green","PUT":"red"},
                 title="Open Interest by Type"
             )
-            strikes = oidf["strike"].unique()
-            fig2 = customize_bar_fig(fig2, under, strikes)
+            fig2.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
             st.plotly_chart(fig2, use_container_width=True)
 
 # =============== TAB 3: VOLATILITY ANALYSIS ===============
@@ -395,42 +371,41 @@ with tab3:
     if not met_full["vol_surface"].empty and len(met_full["vol_surface"]) > 10:
         st.subheader("3D Volatility Surface")
         
-        # Create pivot table for surface (averaged)
-        pivot = met_full["vol_surface"].pivot_table(
-            index="strike", columns="dte", values="volatility", aggfunc="mean"
-        ).sort_index().sort_index(axis=1)
+        # Create pivot table for surface
+        surface_calls = met_full["vol_surface"][met_full["vol_surface"]["type"] == "CALL"]
         
-        if not pivot.empty:
-            z_values = pivot.values
-            z_min_val = np.nanmin(z_values)
-            z_max_val = np.nanmax(z_values)
-            z_range = z_max_val - z_min_val
-            z_min = z_min_val - 0.05 * z_range
-            z_max = z_max_val + 0.05 * z_range
-            
-            fig_surface = go.Figure()
-            
-            # Add surface
-            fig_surface.add_trace(go.Surface(
-                z=z_values,
-                x=pivot.columns,
-                y=pivot.index,
-                colorscale="Viridis",
-                name="Implied Volatility"
-            ))
-            
-            fig_surface.update_layout(
-                title="3D Implied Volatility Surface",
-                scene=dict(
-                    xaxis=dict(title="Days to Expiration", range=[0, 100]),
-                    yaxis=dict(title="Strike Price"),
-                    zaxis=dict(title="Implied Volatility", range=[z_min, z_max]),
-                    aspectmode="manual",
-                    aspectratio=dict(x=0.5, y=1, z=0.3)  # Better scaling for typical data
-                ),
-                height=600
+        if not surface_calls.empty:
+            pivot_calls = surface_calls.pivot_table(
+                index="strike", columns="dte", values="volatility", aggfunc="mean"
             )
-            st.plotly_chart(fig_surface, use_container_width=True)
+            
+            if not pivot_calls.empty:
+                # Calculate min and max implied volatility from the pivot table values
+                z_min = float(pivot_calls.values.min()) + pivot_calls.values.min() * 0.05
+                z_max = float(pivot_calls.values.max()) + pivot_calls.values.max() * 0.05
+                
+                fig_surface = go.Figure()
+                
+                # Add CALL surface
+                fig_surface.add_trace(go.Surface(
+                    z=pivot_calls.values,
+                    x=pivot_calls.columns,
+                    y=pivot_calls.index,
+                    colorscale="Viridis",
+                    name="Implied Volatility"
+                ))
+                
+                fig_surface.update_layout(
+                    title="3D Implied Volatility Surface",
+                    scene=dict(
+                        xaxis=dict(title="Days to Expiration", range=[0, 100]),
+                        yaxis=dict(title="Strike Price"),
+                        zaxis=dict(title="Implied Volatility", range=[z_min, z_max]),
+                        aspectmode="cube"  # Equal scaling for x, y, z axes
+                    ),
+                    height=600
+                )
+                st.plotly_chart(fig_surface, use_container_width=True)
 
     # Volatility Skew by Expiration
     if not met_full["vol_surface"].empty:
@@ -441,7 +416,8 @@ with tab3:
         
         skew_cols = st.columns(2)
         for i, dte in enumerate(unique_dtes):
-            exp_data = df[df["dte"] == dte]  # Use original df for call/put split
+            exp_data = met_full["vol_surface"][met_full["vol_surface"]["dte"] == dte]
+            
             if not exp_data.empty:
                 fig_skew = px.line(
                     exp_data, 
@@ -449,7 +425,7 @@ with tab3:
                     y="volatility", 
                     color="type",
                     markers=True,
-                    color_discrete_map={"CALL": "green", "PUT": "red"},
+                    color_discrete_map={"CALL":"green","PUT":"red"},
                     title=f"Vol Skew - {int(dte)} DTE"
                 )
                 fig_skew.add_vline(x=under, line_dash="dash", line_color="blue")
@@ -479,8 +455,7 @@ with tab4:
                     color="net_gex",
                     color_continuous_scale=["red", "white", "green"]
                 )
-                strikes = met_0dte["net_gex"]["strike"].unique()
-                fig_0dte_gex = customize_bar_fig(fig_0dte_gex, under, strikes)
+                fig_0dte_gex.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
                 fig_0dte_gex.update_layout(showlegend=False)
                 st.plotly_chart(fig_0dte_gex, use_container_width=True)
             else:
@@ -497,8 +472,7 @@ with tab4:
                     color="net_dex",
                     color_continuous_scale=["red", "white", "blue"]
                 )
-                strikes = met_0dte["net_dex"]["strike"].unique()
-                fig_0dte_dex = customize_bar_fig(fig_0dte_dex, under, strikes)
+                fig_0dte_dex.add_vline(x=under, line_dash="dash", line_color="white", annotation_text="Current")
                 fig_0dte_dex.update_layout(showlegend=False)
                 st.plotly_chart(fig_0dte_dex, use_container_width=True)
             else:
