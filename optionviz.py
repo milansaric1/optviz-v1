@@ -88,7 +88,6 @@ def parse_option_chain_data(json_data: dict) -> pd.DataFrame:
 
     if not df.empty:
         # Calculate Days to Expiration (DTE)
-        # DTE is typically calculated as calendar days from today to expiration
         df["dte"] = (df["expiry"] - current_date).dt.days
         # Filter out options that have already expired (DTE < 0)
         df = df[df["dte"] >= 0].copy()
@@ -104,7 +103,11 @@ def parse_option_chain_data(json_data: dict) -> pd.DataFrame:
         df["totalVolume"] = df["totalVolume"].fillna(0)
         
         # Filter out rows with NaN in critical columns for calculations
-        df.dropna(subset=["delta", "gamma", "volatility"], inplace=True)
+        # For volatility surface, we need volatility, strike, dte.
+        # For Greeks, we need delta, gamma.
+        df.dropna(subset=["volatility", "strike", "dte"], inplace=True)
+        # Also ensure volatility is positive and within a reasonable range (e.g., 1% to 500%)
+        df = df[(df["volatility"] > 0.01) & (df["volatility"] < 500)].copy()
 
     return df
 
@@ -145,8 +148,9 @@ def compute_options_metrics(df: pd.DataFrame, underlying_price: float, focus_ran
             return compute_options_metrics(pd.DataFrame(), underlying_price)
 
     # Calculate exposures (using multiplier, typically 100 shares per contract)
-    df_filtered["gamma_exp"] = df_filtered["gamma"] * df_filtered["openInterest"] * df_filtered["multiplier"]
-    df_filtered["delta_exp"] = df_filtered["delta"] * df_filtered["openInterest"] * df_filtered["multiplier"]
+    # Ensure delta and gamma are not NaN before multiplication
+    df_filtered["gamma_exp"] = df_filtered["gamma"].fillna(0) * df_filtered["openInterest"] * df_filtered["multiplier"]
+    df_filtered["delta_exp"] = df_filtered["delta"].fillna(0) * df_filtered["openInterest"] * df_filtered["multiplier"]
 
     # Group by strike and type for OI, Gamma, Volume
     gamma_by_type = (
@@ -192,10 +196,27 @@ def compute_options_metrics(df: pd.DataFrame, underlying_price: float, focus_ran
     net_gex_df = pd.DataFrame(net_gex_data)
     net_dex_df = pd.DataFrame(net_dex_data)
 
-    # Volatility surface data: Filter for valid volatility values
+    # --- Volatility Surface Data Preparation ---
+    # Filter for valid volatility values and options with some liquidity
     vol_surface_df = df_filtered[
-        df_filtered["volatility"].notna() & (df_filtered["volatility"] > 0)
+        (df_filtered["volatility"].notna()) &
+        (df_filtered["volatility"] > 0) &
+        (df_filtered["openInterest"] > 0) # Only consider options with open interest
+        # Or (df_filtered["totalVolume"] > 0) # Could also consider volume
     ].copy()
+    
+    # Optional: Outlier removal for volatility
+    if not vol_surface_df.empty:
+        Q1 = vol_surface_df['volatility'].quantile(0.25)
+        Q3 = vol_surface_df['volatility'].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound_vol = Q1 - 1.5 * IQR
+        upper_bound_vol = Q3 + 1.5 * IQR
+        vol_surface_df = vol_surface_df[
+            (vol_surface_df['volatility'] >= lower_bound_vol) &
+            (vol_surface_df['volatility'] <= upper_bound_vol)
+        ].copy()
+
     # Ensure unique strike-DTE-type combinations for surface plotting
     vol_surface_df = vol_surface_df[["strike", "dte", "volatility", "type", "expiry"]].drop_duplicates()
 
@@ -494,29 +515,43 @@ with tab3:
         st.info("No volatility term structure data available.")
 
     st.subheader("3D Implied Volatility Surface")
-    if not metrics_full["vol_surface"].empty and len(metrics_full["vol_surface"]) > 10:
-        # Pivot table for the surface, averaging volatility for duplicate strike/dte
-        # Use only CALLs for a cleaner surface, or average calls/puts if desired
-        surface_data = metrics_full["vol_surface"].pivot_table(
-            index="strike", columns="dte", values="volatility", aggfunc="mean"
-        )
+    # Check for sufficient data points for a meaningful surface
+    if not metrics_full["vol_surface"].empty and len(metrics_full["vol_surface"]) > 20: # Increased threshold
+        # Create pivot table for the surface, averaging volatility for duplicate strike/dte
+        # Consider only CALLs or PUTs, or average both. For a cleaner surface, often one type is used.
+        # Let's use the average of CALL and PUT volatility if both exist for a strike/DTE
+        
+        # Aggregate by strike, dte, and type, then average volatility
+        # This handles cases where multiple options might exist for same strike/dte (e.g., different series)
+        surface_data_agg = metrics_full["vol_surface"].groupby(["strike", "dte"])["volatility"].mean().unstack(fill_value=np.nan)
 
-        if not surface_data.empty:
+        if not surface_data_agg.empty:
+            # Optional: Interpolate missing values for a smoother surface
+            # This can be dangerous if data is too sparse, but helps with visual continuity
+            # Choose an interpolation method (e.g., 'linear', 'cubic', 'nearest')
+            # For a surface, 'linear' or 'cubic' might be appropriate if data gaps are small.
+            # For now, let's try without heavy interpolation first, as it can mask data issues.
+            # If the surface is still very jagged, consider:
+            # surface_data_agg = surface_data_agg.interpolate(method='linear', axis=1).interpolate(method='linear', axis=0)
+
             # Ensure DTE columns are numeric and sorted
-            surface_data.columns = pd.to_numeric(surface_data.columns)
-            surface_data = surface_data.sort_index(axis=1)
+            surface_data_agg.columns = pd.to_numeric(surface_data_agg.columns)
+            surface_data_agg = surface_data_agg.sort_index(axis=1) # Sort DTEs
+            surface_data_agg = surface_data_agg.sort_index(axis=0) # Sort Strikes
 
             # Calculate min/max for Z-axis to ensure good scaling
-            z_values = surface_data.values[~np.isnan(surface_data.values)]
+            z_values = surface_data_agg.values[~np.isnan(surface_data_agg.values)]
             z_min = np.min(z_values) * 0.9 if z_values.size > 0 else 0
             z_max = np.max(z_values) * 1.1 if z_values.size > 0 else 100 # Default max if no data
 
             fig_surface = go.Figure(data=[go.Surface(
-                z=surface_data.values,
-                x=surface_data.columns,
-                y=surface_data.index,
-                colorscale="Viridis",
-                colorbar_title="Implied Volatility (%)"
+                z=surface_data_agg.values,
+                x=surface_data_agg.columns,
+                y=surface_data_agg.index,
+                colorscale="Viridis", # Good default, consider "Plasma", "Jet", "Hot"
+                colorbar_title="Implied Volatility (%)",
+                # Add contour lines for better readability
+                contours_z=dict(show=True, usecolormap=True, highlightcolor="white", project_z=True)
             )])
 
             fig_surface.update_layout(
@@ -525,17 +560,20 @@ with tab3:
                     xaxis_title="Days to Expiration (DTE)",
                     yaxis_title="Strike Price",
                     zaxis_title="Implied Volatility (%)",
-                    xaxis=dict(range=[0, surface_data.columns.max() * 1.1]),
+                    xaxis=dict(range=[0, surface_data_agg.columns.max() * 1.1 if not surface_data_agg.columns.empty else 100]),
                     zaxis=dict(range=[z_min, z_max]),
-                    aspectmode="auto" # Let Plotly determine aspect ratio
+                    aspectmode="auto", # Let Plotly determine aspect ratio
+                    camera=dict(
+                        eye=dict(x=1.8, y=1.8, z=0.8) # Adjust camera angle for better initial view
+                    )
                 ),
                 height=600
             )
             st.plotly_chart(fig_surface, use_container_width=True)
         else:
-            st.info("Not enough data points to render a meaningful 3D volatility surface.")
+            st.info("Not enough aggregated volatility data points to render a meaningful 3D volatility surface.")
     else:
-        st.info("Not enough data points to render a meaningful 3D volatility surface.")
+        st.info("Not enough raw volatility data points to attempt rendering a 3D volatility surface. (Need > 20 points)")
 
     st.subheader("Volatility Skew by Expiration")
     if not metrics_full["vol_surface"].empty:
