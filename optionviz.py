@@ -8,9 +8,9 @@ import numpy as np
 from datetime import datetime
 
 st.set_page_config(layout="wide")
-st.title("OptvizV2 - Reworked")
+st.title("OptvizV3 - Reworked with Token Caching Fix")
 
-@st.cache_data
+@st.cache_data(ttl=1800)  # Cache for 30 minutes, assuming token expires in 30 min
 def get_access_token():
     resp = requests.post(
         "https://api.schwabapi.com/v1/oauth/token",
@@ -26,7 +26,7 @@ def fetch_option_chain(sym, token):
     params = {
         "symbol": sym,
         "contractType": "ALL",
-        "strikeRange": "ALL",  # Fetch all strikes
+        "strikeRange": "ALL",
         "strategy": "SINGLE",
         "includeUnderlyingQuote": "TRUE",
         "optionType": "ALL"
@@ -44,7 +44,6 @@ def parse_chain(js):
                 for o in opts:
                     r = {"expiry": date, "strike": float(strike_str), "type": kind}
                     r.update(o)
-                    # Ensure volatility is float, handle 'NaN'
                     if "volatility" in r and r["volatility"] == "NaN":
                         r["volatility"] = np.nan
                     else:
@@ -91,7 +90,7 @@ def compute_metrics(df, underlying, focus_range=None):
         
         call_dex = strike_data[strike_data["type"] == "CALL"]["delta_exp"].sum()
         put_dex = strike_data[strike_data["type"] == "PUT"]["delta_exp"].sum()
-        net_dex = call_dex + put_dex  # Puts have negative delta
+        net_dex = call_dex + put_dex
         
         net_gex_data.append({"strike": strike, "net_gex": net_gex})
         net_dex_data.append({"strike": strike, "net_dex": net_dex})
@@ -99,11 +98,9 @@ def compute_metrics(df, underlying, focus_range=None):
     net_gex_df = pd.DataFrame(net_gex_data)
     net_dex_df = pd.DataFrame(net_dex_data)
 
-    # Volatility surface: average vol across call/put for same strike/dte
     vol_surface = df[df["volatility"].notna() & (df["volatility"] > 0)].copy()
     vol_surface = vol_surface.groupby(["strike", "dte", "expiry"])["volatility"].mean().reset_index()
 
-    # Volatility term structure
     vol_term_data = []
     for expiry in df["expiry"].unique():
         exp_data = df[df["expiry"] == expiry]
@@ -117,7 +114,6 @@ def compute_metrics(df, underlying, focus_range=None):
 
     vol_term_df = pd.DataFrame(vol_term_data).sort_values("dte")
 
-    # Levels
     strikes = sorted(df["strike"].unique()) if not df.empty else []
     atm = min(strikes, key=lambda x: abs(x - underlying)) if strikes else None
     
@@ -129,8 +125,8 @@ def compute_metrics(df, underlying, focus_range=None):
 
     pain = {}
     for S in strikes:
-        c = df[(df["type"] == "CALL") & (df["strike"] < S)]  # ITM calls
-        p = df[(df["type"] == "PUT") & (df["strike"] > S)]  # ITM puts
+        c = df[(df["type"] == "CALL") & (df["strike"] < S)]
+        p = df[(df["type"] == "PUT") & (df["strike"] > S)]
         loss = ((S - c["strike"]) * c["openInterest"] * 100).sum() + ((p["strike"] - S) * p["openInterest"] * 100).sum()
         pain[S] = loss
     max_pain = min(pain, key=pain.get) if pain else None
@@ -147,7 +143,8 @@ def compute_metrics(df, underlying, focus_range=None):
     }
 
 def get_0dte_data(df):
-    return df[df["dte"] == 0]  # Strict 0DTE (today's expiration)
+    today = pd.Timestamp.now().date()
+    return df[df["expiry"].dt.date == today]
 
 # Main App
 sym = st.text_input("Ticker", "").upper().strip()
@@ -176,6 +173,15 @@ try:
     df_0dte = get_0dte_data(df)
     met_0dte = compute_metrics(df_0dte, under, focus_range=0.10)
     
+except requests.exceptions.HTTPError as e:
+    if e.response.status_code == 401:
+        st.warning("Access token expired or invalid. Clearing cache and retrying...")
+        get_access_token.clear()
+        token = get_access_token()
+        js = fetch_option_chain(sym, token)
+        # Proceed as above
+    else:
+        raise
 except Exception as e:
     st.error(f"An error occurred: {e}")
     st.stop()
@@ -309,7 +315,7 @@ with tab4:
     st.subheader("⚡ 0DTE Options Analysis")
     
     if df_0dte.empty:
-        st.warning("No 0DTE options found for this symbol.")
+        st.warning("No 0DTE options found for this symbol. Note: On non-trading days, 0DTE may not be available.")
     else:
         st.info(f"Found {len(df_0dte)} 0DTE options")
         
@@ -347,8 +353,9 @@ with tab4:
             avg_0dte_vol = df_0dte["totalVolume"].mean() if not df_0dte.empty else 0
             st.metric("Avg Volume", f"{avg_0dte_vol:,.0f}")
         with col4:
-            max_0dte_oi_strike = df_0dte.loc[df_0dte["openInterest"].idxmax(), "strike"] if not df_0dte.empty else 0
-            st.metric("Max OI Strike", f"${max_0dte_oi_strike:.0f}")
+            if not df_0dte.empty:
+                max_0dte_oi_strike = df_0dte.loc[df_0dte["openInterest"].idxmax(), "strike"]
+                st.metric("Max OI Strike", f"${max_0dte_oi_strike:.0f}")
 
 with tab5:
     st.subheader("Raw Option Chain Data")
